@@ -1,111 +1,178 @@
 const express = require('express');
-const axios = require('axios');
 const bodyParser = require('body-parser');
-const WebSocket = require('ws');
+const axios = require('axios');
+const crypto = require('crypto');
+const path = require('path');
 
 const app = express();
 const port = 3000;
-const wss = new WebSocket.Server({ port: 8080 }); // WebSocket server
 
-app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-app.use(express.static('public'));
-
-let timer = null;
-let requestCount = 0;
-
-// Function to share a post
-async function sharePost(accessToken, shareUrl) {
-  try {
-    const response = await axios.post(
-      `https://graph.facebook.com/me/feed?access_token=${accessToken}&fields=id&limit=1&published=0`,
-      {
-        link: shareUrl,
-        privacy: { value: 'SELF' },
-        no_story: true,
-      }
-    );
-
-    const postId = response?.data?.id;
-
-    if (!postId) {
-      throw new Error('Failed to share post: Unknown error');
+function randomString(length) {
+    const characters = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += characters.charAt(Math.floor(Math.random() * characters.length));
     }
-
-    console.log(`Post shared: ${postId}`);
-    return postId;
-  } catch (error) {
-    console.error('Failed to share post:', error.response?.data?.error?.message || 'Unknown error');
-    throw error;
-  }
+    return result;
 }
 
-// Function to delete a post
-async function deletePost(accessToken, postId) {
-  try {
-    await axios.delete(`https://graph.facebook.com/${postId}?access_token=${accessToken}`);
-    console.log(`Post deleted: ${postId}`);
-  } catch (error) {
-    console.error('Failed to delete post:', error.response?.data?.error?.message || 'Unknown error');
-    throw error;
-  }
+function encodeSig(data) {
+    const sortedData = Object.keys(data).sort().reduce((obj, key) => {
+        obj[key] = data[key];
+        return obj;
+    }, {});
+    const dataStr = Object.entries(sortedData).map(([key, value]) => `${key}=${value}`).join('');
+    return crypto.createHash('md5').update(dataStr + '62f8ce9f74b12f84c123cc23437a4a32').digest('hex');
 }
 
-// WebSocket server
-wss.on('connection', function connection(ws) {
-  ws.on('message', function incoming(message) {
-    console.log('received: %s', message);
-  });
+function convertCookie(session) {
+    return session.map(item => `${item.name}=${item.value}`).join('; ');
+}
+
+async function convertToken(token) {
+    try {
+        const response = await axios.get(`https://api.facebook.com/method/auth.getSessionforApp?format=json&access_token=${token}&new_app_id=275254692598279`);
+        return response.data.access_token;
+    } catch (error) {
+        throw new Error('Failed to convert token');
+    }
+}
+
+function convert2FA(twofactorCode) {
+    const code = parseInt(twofactorCode);
+    return isNaN(code) ? null : code;
+}
+
+async function makeRequest(email, password, twofactorCode) {
+    const deviceID = crypto.randomUUID();
+    const adid = crypto.randomUUID();
+    const randomStr = randomString(24);
+
+    const form = {
+        adid,
+        email,
+        password,
+        format: 'json',
+        device_id: deviceID,
+        cpl: 'true',
+        family_device_id: deviceID,
+        locale: 'en_US',
+        client_country_code: 'US',
+        credentials_type: 'device_based_login_password',
+        generate_session_cookies: '1',
+        generate_analytics_claim: '1',
+        generate_machine_id: '1',
+        currently_logged_in_userid: '0',
+        irisSeqID: 1,
+        try_num: '1',
+        enroll_misauth: 'false',
+        meta_inf_fbmeta: 'NO_FILE',
+        source: 'login',
+        machine_id: randomStr,
+        fb_api_req_friendly_name: 'authenticate',
+        fb_api_caller_class: 'com.facebook.account.login.protocol.Fb4aAuthHandler',
+        api_key: '882a8490361da98702bf97a021ddc14d',
+        access_token: '350685531728%7C62f8ce9f74b12f84c123cc23437a4a32',
+    };
+
+    form.sig = encodeSig(form);
+
+    const headers = {
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-fb-friendly-name': form.fb_api_req_friendly_name,
+        'x-fb-http-engine': 'Liger',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+    };
+
+    const url = 'https://b-graph.facebook.com/auth/login';
+
+    try {
+        const response = await axios.post(url, form, { headers });
+
+        if (response.status === 200) {
+            let data = response.data;
+            if ('session_cookies' in data) {
+                data.cookies = convertCookie(data.session_cookies);
+            }
+            if ('access_token' in data) {
+                data.access_token = await convertToken(data.access_token);
+            }
+            return {
+                status: true,
+                message: 'Retrieve information successfully!',
+                data,
+            };
+        } else if (response.status === 401) {
+            return {
+                status: false,
+                message: response.data.error.message,
+            };
+        } else if ('twofactor' in response.data && response.data.twofactor === '0') {
+            return {
+                status: false,
+                message: 'Please enter the 2-factor authentication code!',
+            };
+        } else {
+            twofactorCode = convert2FA(twofactorCode);
+            if (twofactorCode !== null) {
+                form.twofactor_code = twofactorCode;
+                form.encrypted_msisdn = '';
+                form.userid = response.data.error.error_data.uid;
+                form.machine_id = response.data.error.error_data.machine_id;
+                form.first_factor = response.data.error.error_data.login_first_factor;
+                form.credentials_type = 'two_factor';
+                form.sig = encodeSig(form);
+
+                const secondResponse = await axios.post(url, form, { headers });
+
+                if (secondResponse.status === 200) {
+                    let data = secondResponse.data;
+                    if ('session_cookies' in data) {
+                        data.cookies = convertCookie(data.session_cookies);
+                    }
+                    if ('access_token' in data) {
+                        data.access_token = await convertToken(data.access_token);
+                    }
+                    return {
+                        status: true,
+                        message: 'Retrieve information successfully!',
+                        data,
+                    };
+                } else {
+                    return {
+                        status: false,
+                        message: secondResponse.data,
+                    };
+                }
+            } else {
+                return {
+                    status: false,
+                    message: 'Invalid 2-factor authentication code!',
+                };
+            }
+        }
+    } catch (error) {
+        return {
+            status: false,
+            message: 'Please check your account and password again!',
+        };
+    }
+}
+
+app.post('/login', async (req, res) => {
+    const { email, password, twofactorCode } = req.body;
+    const result = await makeRequest(email, password, twofactorCode);
+    res.json(result);
 });
 
-// Route to start sharing posts
-app.post('/share', async (req, res) => {
-  const { accessToken, shareUrl, shareAmount, shareInterval } = req.body;
-  let sharedCount = 0;
-
-  try {
-    // Start sharing posts
-    timer = setInterval(async () => {
-      try {
-        if (requestCount >= 50000) { // Example: Limit to 5000 requests per hour
-          clearInterval(timer);
-          console.log('Exceeded rate limit. Stopping sharing.');
-          return;
-        }
-
-        const postId = await sharePost(accessToken, shareUrl);
-        sharedCount++;
-        requestCount++;
-
-        if (sharedCount === parseInt(shareAmount)) {
-          clearInterval(timer);
-          console.log('Finished sharing posts.');
-
-          setTimeout(async () => {
-            await deletePost(accessToken, postId);
-          }, deleteAfter * 1000);
-        }
-      } catch (error) {
-        clearInterval(timer);
-        console.log('Loop stopped due to error.');
-      }
-    }, parseInt(shareInterval) * 1000);
-
-    res.status(200).send('Sharing started.');
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).send('Internal Server Error');
-  }
-});
-
-// Route to stop sharing posts
-app.post('/stop', (req, res) => {
-  clearInterval(timer);
-  console.log('Loop stopped.');
-  res.status(200).send('Sharing stopped.');
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+    console.log(`Server listening at http://localhost:${port}`);
 });
+          
